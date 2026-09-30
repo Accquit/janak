@@ -3,19 +3,16 @@
 The simulator is a *world clock*. It owns the warehouse, the robots,
 the task list and the event log. Each tick the simulator:
 
-1. Builds a fresh :class:`WorldView` for every robot.
-2. Calls :meth:`Robot.step` on every robot and records the events it
-   produced. The simulator does not decide paths, resolve conflicts or
-   assign tasks; those decisions live in the robot (or, in the next
-   layer, in dedicated agent modules).
-3. Updates task progress based on robot positions and the task
-   phases (a robot that reaches its pickup advances to dropoff;
-   reaching the dropoff completes the task).
-4. Runs the configured dynamic-obstacle schedule (foundation: a
-   deterministic timeline of placements and removals).
-5. Detects position collisions between robots and logs them. No
-   resolution.
-6. Advances its internal clock.
+1. Applies the configured deterministic dynamic-obstacle schedule.
+2. Builds a fresh :class:`WorldView` for every robot.
+3. Processes coordination messages, reservations, and negotiation.
+4. Preflights proposed moves against physical occupancy and local
+   reservations, then calls :meth:`Robot.step` and records its events.
+   Path choice, conflict negotiation, and task assignment remain in
+   their existing robot and coordination layers.
+5. Updates task progress and post-motion plans.
+6. Publishes final robot states, logs any remaining position collisions,
+   and advances the internal clock.
 
 Determinism
 -----------
@@ -384,8 +381,6 @@ class Simulator:
             return
         positions: Dict[CellCoord, List[str]] = {}
         for robot in self.robots:
-            if robot.status is RobotStatus.FAILED:
-                continue
             positions.setdefault(robot.position, []).append(robot.robot_id)
         for pos, ids in positions.items():
             if len(ids) > 1:
@@ -395,6 +390,83 @@ class Simulator:
                     position=list(pos),
                     robot_ids=sorted(ids),
                 ))
+
+    def _movement_safety_blocks(self) -> Dict[str, str]:
+        """Preflight this tick's moves against physical and local claims.
+
+        The snapshot is taken after negotiation and before any robot mutates
+        its position, so iteration order cannot grant one robot a cell first.
+        """
+        intents: Dict[str, Tuple[Robot, CellCoord]] = {}
+        blocked: Dict[str, str] = {}
+
+        for robot in self.robots:
+            if robot.status is RobotStatus.FAILED or robot.battery <= 0.0:
+                continue
+            if robot.coordination is not None and (
+                robot.coordination.lifecycle.state is RobotLifecycleState.SAFE_HALT
+            ):
+                continue
+            if robot.status not in (RobotStatus.MOVING, RobotStatus.WAITING):
+                continue
+            if (
+                robot.status is RobotStatus.WAITING
+                and robot.waiting_until_tick is not None
+                and self.tick_count < robot.waiting_until_tick
+            ):
+                continue
+            next_cell = robot.next_path_cell()
+            if next_cell is not None and tuple(next_cell) != robot.position:
+                intents[robot.robot_id] = (robot, tuple(next_cell))
+
+        for robot_id, (robot, destination) in intents.items():
+            if (
+                abs(destination[0] - robot.position[0])
+                + abs(destination[1] - robot.position[1])
+            ) != 1:
+                blocked[robot_id] = "invalid_transition"
+                continue
+            if not self.warehouse.is_traversable(*destination):
+                blocked[robot_id] = "cell_not_traversable"
+                continue
+            if robot.coordination is None:
+                continue
+            reservations = robot.coordination.reservations
+            arrival_tick = self.tick_count + 1
+            if not reservations.has_robot(destination, arrival_tick, robot_id):
+                blocked[robot_id] = "missing_own_reservation"
+                continue
+            peer_owners = reservations.robots_at(destination, arrival_tick) - {robot_id}
+            if peer_owners:
+                blocked[robot_id] = "peer_reservation"
+            reverse_edge_peers = (
+                reservations.robots_at(destination, self.tick_count)
+                & reservations.robots_at(robot.position, arrival_tick)
+            ) - {robot_id}
+            if reverse_edge_peers:
+                blocked[robot_id] = "peer_reverse_edge_reservation"
+
+        destinations: Dict[CellCoord, List[str]] = {}
+        for robot_id, (_, destination) in intents.items():
+            destinations.setdefault(destination, []).append(robot_id)
+        for robot_ids in destinations.values():
+            if len(robot_ids) > 1:
+                for robot_id in robot_ids:
+                    blocked.setdefault(robot_id, "shared_destination")
+
+        # A cell remains occupied for this tick even if its current owner
+        # intends to leave. Waiting for the next tick avoids overlap and
+        # prevents swap moves from crossing through one another.
+        occupied = {
+            robot.position: robot.robot_id
+            for robot in self.robots
+        }
+        for robot_id, (robot, destination) in intents.items():
+            occupant_id = occupied.get(destination)
+            if occupant_id is not None and occupant_id != robot_id:
+                blocked.setdefault(robot_id, "occupied_cell")
+
+        return blocked
 
     # ------------------------------------------------------------------
     # Main tick
@@ -411,26 +483,26 @@ class Simulator:
         1. Apply the dynamic-obstacle schedule.
         2. Refresh each robot's :class:`WorldView`.
         3. **Phase 2A** — deliver bus messages from the previous tick.
-        4. **Phase 2A** — each robot processes its inbox (updates peer
-           state and peer reservations).
-        5. **Phase 2A** — each robot rebuilds its own reservations
-           from its current state.
-        6. **Phase 2A** — each robot runs its local conflict detector.
-        7. **Phase 2B** — each robot runs its local negotiation on
-           the detected conflicts (may reroute or yield).
-        8. **Phase 1** — each robot's :meth:`Robot.step` runs (motion).
-        9. **Phase 1** — task progress / pickup-to-dropoff replan.
+        4. Process received peer messages, then apply stale-peer and
+           SAFE_HALT checks using the local receive tick.
+        5. Each coordinated robot rebuilds its own reservations and runs
+           local conflict detection and negotiation.
+        6. Preflight all proposed moves against occupancy, traversability,
+           vertex reservations, and reverse-edge reservations.
+        7. Call each robot's :meth:`Robot.step` with its safety decision.
+        8. **Phase 1** — task progress / pickup-to-dropoff replan.
            Robots that just completed a pickup now hold the *full*
            intended trajectory; if the path changed, the
-           corresponding reservations are refreshed in step 9b.
-        10. **Phase 2B.1 — FINAL post-tick broadcast** (after motion
+           corresponding reservations are refreshed in the second
+           conflict-detection pass.
+        9. **Phase 2B.1 — FINAL post-tick broadcast** (after motion
             AND after any pickup->dropoff replan). Peers therefore
             always see the robot's FINAL trajectory for the tick.
-        11. Detect collisions (logging only).
-        12. Advance the clock.
+        10. Detect any remaining collisions and advance the clock.
 
-        Robots without a ``coordination`` field are entirely skipped
-        at steps 3-7 and 10; their behaviour is identical to Phase 1.
+        Robots without a ``coordination`` field are skipped by the
+        message, reservation, and negotiation hooks, but still pass
+        through the shared physical movement preflight.
         """
         events: List[Event] = []
 
@@ -455,8 +527,23 @@ class Simulator:
         if self.message_bus is not None:
             self.message_bus.deliver()
 
-        # 4-6. Phase 2A: coordination hooks before motion.
+        # 4. Process delivered peer messages before liveness checks. The
+        # local receive tick (not the sender's older broadcast tick) is
+        # what determines whether SAFE_HALT can recover now.
         coordination_robots = [r for r in self.robots if r.coordination is not None]
+        for robot in coordination_robots:
+            processed = robot.coordination.process_inbox(current_tick=self.tick_count)
+            if robot.coordination.last_peer_heartbeat_tick == self.tick_count:
+                self._last_peer_heartbeat_tick[robot.robot_id] = self.tick_count
+            if processed > 0:
+                for peer_id, state in robot.coordination.peer_states.all().items():
+                    events.append(Event(
+                        self.tick_count,
+                        EventType.PEER_STATE_UPDATED,
+                        robot_id=robot.robot_id,
+                        peer_id=peer_id,
+                        peer_timestamp=state.timestamp,
+                    ))
 
         # Cache predicted conflicts per robot so step 7 (negotiation)
         # can reuse them without re-running the detector.
@@ -468,23 +555,10 @@ class Simulator:
         max_task_priority = max([t.priority for t in self.tasks], default=0)
         max_task_priority = max(1, max_task_priority)
 
-        # Phase 2C 4a: record peer-heartbeat tick for every robot
-        # that just received a valid peer broadcast this tick.
-        # Only update if there is at least one peer whose last seen
-        # tick is THIS tick (i.e. we actually got a fresh broadcast).
-        for robot in coordination_robots:
-            fresh = False
-            for info in robot.coordination.peer_liveness.all().values():
-                if info.last_seen_tick == self.tick_count:
-                    fresh = True
-                    break
-            if fresh:
-                self._last_peer_heartbeat_tick[robot.robot_id] = self.tick_count
-
         # Phase 2C 4b: stale-peer sweep. Any peer whose last valid
-        # heartbeat is older than STALE_THRESHOLD ticks has its
-        # forward reservations cleared and is marked STALE in the
-        # local view.
+        # heartbeat is older than STALE_THRESHOLD ticks has its forward
+        # reservations cleared, while its last known cell remains held
+        # through the local reservation horizon.
         from ..coordination.resilience import (
             PEER_FAILURE_TIMEOUT, SELF_ISOLATION_TIMEOUT, STALE_THRESHOLD,
         )
@@ -493,12 +567,12 @@ class Simulator:
 
         # Phase 2C 4b.5: peer-failure sweep. Any peer whose last
         # valid heartbeat is older than PEER_FAILURE_TIMEOUT ticks is
-        # declared OFFLINE; its forward reservations are released.
+        # declared OFFLINE; its last known cell remains reserved.
         failed_peers: Dict[str, List] = {}
         for robot in coordination_robots:
             liveness = robot.coordination.peer_liveness
             for pid, info in liveness.all().items():
-                if info.status == "offline":
+                if info.status is RobotLifecycleState.OFFLINE:
                     continue
                 last = info.last_seen_tick
                 if last < 0:
@@ -526,7 +600,6 @@ class Simulator:
 
         # Phase 2C 4d: recovery. A SAFE_HALT robot that has just
         # received a peer heartbeat in this tick resumes ACTIVE.
-        from ..coordination.lifecycle import RobotLifecycleState
         for robot in coordination_robots:
             if (
                 robot.coordination.lifecycle.state == RobotLifecycleState.SAFE_HALT
@@ -535,16 +608,6 @@ class Simulator:
                 events.extend(robot.coordination.exit_safe_halt(self.tick_count))
 
         for robot in coordination_robots:
-            processed = robot.coordination.process_inbox()
-            if processed > 0:
-                for peer_id, state in robot.coordination.peer_states.all().items():
-                    events.append(Event(
-                        self.tick_count,
-                        EventType.PEER_STATE_UPDATED,
-                        robot_id=robot.robot_id,
-                        peer_id=peer_id,
-                        peer_timestamp=state.timestamp,
-                    ))
             robot.coordination.update_own_reservations(
                 current_pos=robot.position,
                 path=robot.remaining_path(),
@@ -567,8 +630,13 @@ class Simulator:
             ))
 
         # 8. Phase 1: motion.
+        safety_blocks = self._movement_safety_blocks()
         for robot in self.robots:
-            events.extend(robot.step(self.tick_count, self.warehouse))
+            events.extend(robot.step(
+                self.tick_count,
+                self.warehouse,
+                safety_blocked_reason=safety_blocks.get(robot.robot_id),
+            ))
 
         # 9. Phase 1: task progress / pickup-to-dropoff replan.
         events.extend(self._update_tasks())
