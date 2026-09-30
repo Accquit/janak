@@ -1,0 +1,6 @@
+# SIH26123 foundation dependencies.
+# Python 3.11+ is required (uses modern type hints like tuple[int, int]).
+# Standard library only for the foundation; Pygame is intentionally
+# NOT included yet (visualization is optional at this stage).
+
+pytest>=8.0
