@@ -58,6 +58,21 @@ from .resilience import (
 CellCoord = tuple[int, int]
 
 
+def _is_cell_coord(value) -> bool:
+    return (
+        isinstance(value, (tuple, list))
+        and len(value) == 2
+        and all(type(component) is int for component in value)
+    )
+
+
+def _is_fresh_peer_tick(peer_tick: int, current_tick: Optional[int]) -> bool:
+    if current_tick is None:
+        return True
+    age = current_tick - peer_tick
+    return 0 <= age < STALE_THRESHOLD
+
+
 @dataclass
 class RobotCoordination:
     """The local coordination module of a single robot.
@@ -129,7 +144,7 @@ class RobotCoordination:
     # ------------------------------------------------------------------
     # Inbox
     # ------------------------------------------------------------------
-    def process_inbox(self) -> int:
+    def process_inbox(self, current_tick: Optional[int] = None) -> int:
         """Drain the inbox and update peer state + reservations.
 
         Also records incoming :class:`ConflictProposal` messages for
@@ -146,13 +161,38 @@ class RobotCoordination:
         """
         messages = self.bus.drain_inbox(self.robot_id)
         processed = 0
-        peer_received_this_call = False
         for msg in messages:
             if msg.msg_type is MessageType.ROBOT_STATE:
                 state = msg.payload
                 if isinstance(state, RobotState):
-                    if state.robot_id == self.robot_id:
-                        continue  # never from self
+                    if (
+                        state.robot_id == self.robot_id
+                        or state.robot_id != msg.sender_id
+                        or type(state.timestamp) is not int
+                        or state.timestamp != msg.timestamp
+                        or (
+                            current_tick is not None
+                            and state.timestamp > current_tick
+                        )
+                        or not _is_cell_coord(state.position)
+                        or not isinstance(state.planned_path, (tuple, list))
+                        or any(not _is_cell_coord(cell) for cell in state.planned_path)
+                    ):
+                        continue  # malformed, misattributed, or from self
+                    # A state is fresh only when its full (tick, sequence)
+                    # pair advances. Reject reordered packets before they
+                    # can overwrite either position or reservations.
+                    if not self.peer_liveness.record_heartbeat(
+                        peer_id=state.robot_id,
+                        tick=state.timestamp,
+                        sequence=state.sequence,
+                        position=state.position,
+                    ):
+                        continue
+                    if _is_fresh_peer_tick(state.timestamp, current_tick):
+                        self.last_peer_heartbeat_tick = (
+                            current_tick if current_tick is not None else state.timestamp
+                        )
                     if self.peer_states.update(state):
                         self.reservations.update_peer_from_state(
                             peer_id=state.robot_id,
@@ -161,16 +201,7 @@ class RobotCoordination:
                             peer_timestamp=state.timestamp,
                             horizon=self.conflict_detector.lookahead_horizon,
                         )
-                        # Phase 2C: track peer freshness for staleness,
-                        # isolation, and failure detection.
-                        self.peer_liveness.record_heartbeat(
-                            peer_id=state.robot_id,
-                            tick=state.timestamp,
-                            sequence=state.sequence,
-                            position=state.position,
-                        )
                         processed += 1
-                        peer_received_this_call = True
             elif msg.msg_type is MessageType.HEARTBEAT:
                 # Phase 2C: bare heartbeat with no payload, used for
                 # liveness-only signals (no reservation update).
@@ -179,24 +210,52 @@ class RobotCoordination:
                 tick_v = info.get("tick", msg.timestamp)
                 seq_v = info.get("sequence", 0)
                 pos_v = info.get("position")
-                if pid == self.robot_id:
+                if (
+                    not isinstance(pid, str)
+                    or pid == self.robot_id
+                    or pid != msg.sender_id
+                ):
                     continue
-                self.peer_liveness.record_heartbeat(
+                previous_info = self.peer_liveness.get(pid)
+                if (
+                    type(tick_v) is not int
+                    or tick_v != msg.timestamp
+                    or (current_tick is not None and tick_v > current_tick)
+                    or type(seq_v) is not int
+                    or (
+                        pos_v is None
+                        and (
+                            previous_info is None
+                            or previous_info.last_known_position is None
+                        )
+                    )
+                    or (pos_v is not None and not _is_cell_coord(pos_v))
+                ):
+                    continue
+                accepted = self.peer_liveness.record_heartbeat(
                     peer_id=pid,
                     tick=tick_v,
                     sequence=seq_v,
                     position=pos_v,
                 )
-                peer_received_this_call = True
+                if accepted:
+                    if _is_fresh_peer_tick(tick_v, current_tick):
+                        self.last_peer_heartbeat_tick = (
+                            current_tick if current_tick is not None else tick_v
+                        )
+                    peer_info = self.peer_liveness.get(pid)
+                    if peer_info is not None and peer_info.last_known_position is not None:
+                        self.peer_states.forget(pid)
+                        self.reservations.reserve_stationary(
+                            pid,
+                            peer_info.last_known_position,
+                            current_tick if current_tick is not None else tick_v,
+                            self.conflict_detector.lookahead_horizon,
+                        )
             elif msg.msg_type is MessageType.CONFLICT_PROPOSAL:
                 proposal = msg.payload
                 if isinstance(proposal, ConflictProposal):
                     self._record_proposal(proposal)
-        if peer_received_this_call:
-            self.last_peer_heartbeat_tick = self.last_peer_heartbeat_tick
-            # The simulator updates last_peer_heartbeat_tick externally
-            # by passing the current tick in (see Simulator.tick step
-            # 4b). Local recording is left here as a hook.
         return processed
 
     # ------------------------------------------------------------------
@@ -650,6 +709,20 @@ class RobotCoordination:
             bucket = self.reservations.robots_at((x, y), t)
             return any(rid != self.robot_id for rid in bucket)
 
+        def is_reverse_edge_blocked(
+            origin: CellCoord,
+            destination_cell: CellCoord,
+            departure_tick: int,
+            arrival_tick: int,
+        ) -> bool:
+            if origin == destination_cell:
+                return False
+            at_destination = self.reservations.robots_at(
+                destination_cell, departure_tick,
+            )
+            at_origin = self.reservations.robots_at(origin, arrival_tick)
+            return bool((at_destination & at_origin) - {self.robot_id})
+
         sx, sy = robot.position
         gx, gy = destination
         manhattan = abs(sx - gx) + abs(sy - gy)
@@ -666,6 +739,7 @@ class RobotCoordination:
             is_cell_traversable=warehouse.is_traversable,
             is_blocked_at=is_blocked,
             max_timestep=max_timestep,
+            is_transition_blocked=is_reverse_edge_blocked,
         )
         if path is None:
             return None
@@ -742,6 +816,8 @@ class RobotCoordination:
         events: list = []
         stale_ids = self.peer_liveness.stale_peers(current_tick, STALE_THRESHOLD)
         for pid in stale_ids:
+            if not self.peer_liveness.mark_stale(pid):
+                continue
             self.peer_states.forget(pid)
             cleared = self.reservations.clear_robot(pid)
             events.append(Event(
@@ -758,14 +834,37 @@ class RobotCoordination:
                 peer_id=pid,
                 cells_cleared=cleared,
             ))
+        # Stale and offline peers do not provide new trajectories. Rebuild
+        # their stationary last-cell claims every tick so the local horizon
+        # cannot expire and accidentally reopen an occupied cell.
+        for pid, info in self.peer_liveness.all().items():
+            if (
+                info.status in (RobotLifecycleState.STALE, RobotLifecycleState.OFFLINE)
+                and info.last_known_position is not None
+            ):
+                self.reservations.reserve_stationary(
+                    pid,
+                    info.last_known_position,
+                    current_tick,
+                    self.conflict_detector.lookahead_horizon,
+                )
         return events
 
     def declare_peer_failed(self, peer_id: str, current_tick: int) -> list:
         """Force-declare ``peer_id`` OFFLINE (>= PEER_FAILURE_TIMEOUT)."""
         from ..simulation.events import Event, EventType
         events: list = []
+        info = self.peer_liveness.get(peer_id)
+        if not self.peer_liveness.mark_failed(peer_id):
+            return events
         cleared = self.reservations.clear_robot(peer_id)
-        self.peer_liveness.mark_failed(peer_id)
+        if info is not None and info.last_known_position is not None:
+            self.reservations.reserve_stationary(
+                peer_id,
+                info.last_known_position,
+                current_tick,
+                self.conflict_detector.lookahead_horizon,
+            )
         events.append(Event(
             current_tick,
             EventType.PEER_FAILED,

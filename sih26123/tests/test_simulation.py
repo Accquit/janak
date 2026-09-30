@@ -152,8 +152,8 @@ def test_events_are_generated(small_warehouse, three_robots, three_tasks, astar_
     assert EventType.TASK_ASSIGNED in types
 
 
-def test_collision_detected_when_two_robots_share_cell(small_warehouse) -> None:
-    # Manually place two robots and drive them to the same cell.
+def test_shared_destination_is_blocked_before_collision(small_warehouse) -> None:
+    # Manually place two robots and drive them toward the same cell.
     view1 = WorldView(warehouse=small_warehouse, robots=[], tick=0)
     p1 = SimulatedPerception(world_view=view1, sensor_range=4, self_id="A")
     a = Robot(robot_id="A", start_position=(1, 1), perception=p1, battery_capacity=200.0)
@@ -168,9 +168,11 @@ def test_collision_detected_when_two_robots_share_cell(small_warehouse) -> None:
 
     sim = Simulator(small_warehouse, [a, b], [], seed=1)
     sim.tick()
-    # After this tick, A and B should both be at (1,2). Collision detected.
+    # The simulator blocks both contenders from entering the occupied target.
     collisions = sim.event_log.of_type(EventType.COLLISION_DETECTED)
-    assert any("A" in e.data.get("robot_ids", []) and "B" in e.data.get("robot_ids", []) for e in collisions)
+    assert a.position == (1, 1)
+    assert b.position == (1, 3)
+    assert collisions == []
 
 
 def test_dynamic_obstacles_appear_in_schedule(small_warehouse, three_robots, three_tasks, astar_planner) -> None:
@@ -271,8 +273,8 @@ def test_assign_without_planner_fails(small_warehouse, three_robots, three_tasks
     assert sim.event_log.count(EventType.TASK_ASSIGNED) >= 1
 
 
-def test_simulator_does_not_resolve_collisions(small_warehouse) -> None:
-    """Two robots that meet at the same position should both end up there."""
+def test_simulator_prevents_same_cell_collision(small_warehouse) -> None:
+    """Two robots with the same next cell must both wait before entering it."""
     view1 = WorldView(warehouse=small_warehouse, robots=[], tick=0)
     a = Robot(robot_id="A", start_position=(1, 1), perception=SimulatedPerception(world_view=view1, sensor_range=4, self_id="A"))
     view2 = WorldView(warehouse=small_warehouse, robots=[], tick=0)
@@ -283,9 +285,6 @@ def test_simulator_does_not_resolve_collisions(small_warehouse) -> None:
 
     sim = Simulator(small_warehouse, [a, b], [], seed=1)
     sim.tick()
-    # Both robots ended up at (1,2) — the simulator records but does not
-    # resolve the conflict. That's exactly the gap the next layer fills.
-    assert a.position == (1, 2)
-    assert b.position == (1, 2)
-    # And a COLLISION_DETECTED event was emitted.
-    assert sim.event_log.count(EventType.COLLISION_DETECTED) >= 1
+    assert a.position == (1, 1)
+    assert b.position == (1, 3)
+    assert sim.event_log.count(EventType.COLLISION_DETECTED) == 0

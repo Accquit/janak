@@ -154,6 +154,19 @@ class ReservationTable:
             horizon=horizon if horizon is not None else self.horizon,
         )
 
+    def reserve_stationary(
+        self,
+        robot_id: str,
+        position: CellCoord,
+        start_tick: int,
+        horizon: Optional[int] = None,
+    ) -> None:
+        """Hold a peer's last known cell across the local safety horizon."""
+        span = self.horizon if horizon is None else max(0, int(horizon))
+        self.clear_robot(robot_id)
+        for offset in range(span + 1):
+            self.add(tuple(position), int(start_tick) + offset, robot_id)
+
     def _reserve_trajectory(
         self,
         robot_id: str,

@@ -65,6 +65,9 @@ def space_time_astar(
     is_cell_traversable: Callable[[int, int], bool],
     is_blocked_at: Callable[[int, int, int], bool],
     max_timestep: Optional[int] = None,
+    is_transition_blocked: Optional[
+        Callable[[CellCoord, CellCoord, int, int], bool]
+    ] = None,
 ) -> Optional[List[SpatioTemporalState]]:
     """A* over a space-time grid.
 
@@ -89,6 +92,9 @@ def space_time_astar(
             Hard upper bound on ``t`` for the search. ``None`` means
             ``start_tick + (width * height)`` (a generous fallback
             that prevents infinite search on disconnected graphs).
+        ``is_transition_blocked``:
+            Optional predicate for transition conflicts such as robots
+            traversing the same edge in opposite directions.
 
     Returns
         A list of space-time states from the planner's perspective,
@@ -177,6 +183,10 @@ def space_time_astar(
             if not is_cell_traversable(nx, ny):
                 continue
             if is_blocked_at(nx, ny, nt):
+                continue
+            if is_transition_blocked is not None and is_transition_blocked(
+                (cx, cy), (nx, ny), ct, nt,
+            ):
                 continue
             new_state: SpatioTemporalState = (nx, ny, nt)
             if new_state in closed:

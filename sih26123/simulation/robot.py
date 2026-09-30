@@ -7,15 +7,12 @@ the robot; it just calls ``step`` once per tick.
 
 Foundation responsibilities of :meth:`step`
 -------------------------------------------
-1. Read its perception to detect static and dynamic obstacles around
-   the planned path.
-2. If the next planned cell is blocked by a dynamic obstacle, transition
-   to :attr:`RobotStatus.WAITING`. (Re-routing is intentionally left
-   for the next layer.)
-3. Otherwise consume battery, advance position along the path, and
-   transition state appropriately when destinations are reached.
-4. Return the list of events the robot produced this tick; the
-   simulator records them.
+1. Check the next planned cell against perception and the world boundary.
+2. Honor the simulator's collision/reservation decision and SAFE_HALT.
+3. Consume battery, advance one path action (including a space-time wait),
+   and transition state appropriately when destinations are reached.
+4. Return the list of events the robot produced this tick; the simulator
+   records them.
 
 This keeps the architecture honest about the eventual decentralization:
 each robot, given only its own state and a local view, can decide what
@@ -201,12 +198,14 @@ class Robot:
         order. The robot's current position is **not** included in the
         path. If A* (or any other planner) returns a path that does
         include the current cell as the first step, it is stripped
-        here. If the resulting path is empty (robot already at
-        destination), the robot transitions to :attr:`RobotStatus.IDLE`.
+        here. Further copies of the current cell are retained as explicit
+        wait actions from a space-time path. If the resulting path is empty
+        (robot already at destination), the robot transitions to
+        :attr:`RobotStatus.IDLE`.
         """
         cleaned = [tuple(c) for c in path]
         # Strip a leading cell equal to the robot's current position.
-        while cleaned and cleaned[0] == self.position:
+        if cleaned and cleaned[0] == self.position:
             cleaned.pop(0)
 
         self.path = cleaned
@@ -229,7 +228,12 @@ class Robot:
     # ------------------------------------------------------------------
     # One tick of local decision-making
     # ------------------------------------------------------------------
-    def step(self, tick: int, world) -> List[Event]:
+    def step(
+        self,
+        tick: int,
+        world,
+        safety_blocked_reason: Optional[str] = None,
+    ) -> List[Event]:
         """Advance the robot by one timestep.
 
         ``world`` is the :class:`simulation.warehouse.Warehouse`
@@ -241,6 +245,13 @@ class Robot:
 
         if self.status is RobotStatus.FAILED:
             return events
+
+        safe_halt = False
+        if self.coordination is not None:
+            from ..coordination.lifecycle import RobotLifecycleState
+            safe_halt = (
+                self.coordination.lifecycle.state is RobotLifecycleState.SAFE_HALT
+            )
 
         # Phase 2B: resume movement after a negotiation-driven wait.
         if (
@@ -263,6 +274,16 @@ class Robot:
             if self.current_task is not None:
                 self.current_task.mark_failed()
             events.append(Event(tick, EventType.ROBOT_FAILED, robot_id=self.robot_id, reason="battery_exhausted"))
+            return events
+
+        # SAFE_HALT is enforced at the physical movement boundary as well
+        # as by the simulator's preflight, so direct callers cannot bypass it.
+        if safe_halt:
+            self.velocity = (0, 0)
+            self.waiting_until_tick = None
+            if self.has_path and self.status in (RobotStatus.MOVING, RobotStatus.WAITING):
+                self.status = RobotStatus.WAITING
+            self.battery = max(0.0, self.battery - self.idle_cost)
             return events
 
         # WAITING robots re-evaluate the path each tick. If the obstacle
@@ -297,6 +318,23 @@ class Robot:
             next_cell = self.next_path_cell()
             assert next_cell is not None
 
+            # Space-time A* may deliberately repeat the current cell to
+            # encode a one-tick wait. Preserve that timing instead of
+            # turning the wait into an immediate move on the next cell.
+            if next_cell == self.position:
+                self.path_index += 1
+                self.velocity = (0, 0)
+                self.battery = max(0.0, self.battery - self.idle_cost)
+                if not self.has_path:
+                    self.status = RobotStatus.IDLE
+                events.append(Event(
+                    tick,
+                    EventType.ROBOT_WAITING,
+                    robot_id=self.robot_id,
+                    reason="planned_wait",
+                ))
+                return events
+
             dynamic_blockers = [
                 o for o in self.perception.get_dynamic_obstacles(self)
                 if o.position == next_cell
@@ -319,6 +357,72 @@ class Robot:
                     robot_id=self.robot_id,
                     obstacle_id=dynamic_blockers[0].obstacle_id,
                     position=list(next_cell),
+                ))
+                return events
+
+            if (
+                safety_blocked_reason is None
+                and abs(next_cell[0] - self.position[0])
+                + abs(next_cell[1] - self.position[1])
+                != 1
+            ):
+                self.status = RobotStatus.WAITING
+                self.velocity = (0, 0)
+                self.waiting_until_tick = None
+                self.battery = max(0.0, self.battery - self.idle_cost)
+                events.append(Event(
+                    tick,
+                    EventType.ROBOT_WAITING,
+                    robot_id=self.robot_id,
+                    reason="safety_guard",
+                    safety_reason="invalid_transition",
+                    blocked_cell=list(next_cell),
+                ))
+                return events
+
+            movement_safety_reason = safety_blocked_reason
+            if movement_safety_reason is None and self.coordination is not None:
+                reservations = self.coordination.reservations
+                arrival_tick = tick + 1
+                if not reservations.has_robot(next_cell, arrival_tick, self.robot_id):
+                    movement_safety_reason = "missing_own_reservation"
+                elif reservations.robots_at(next_cell, arrival_tick) - {self.robot_id}:
+                    movement_safety_reason = "peer_reservation"
+                elif (
+                    reservations.robots_at(next_cell, tick)
+                    & reservations.robots_at(self.position, arrival_tick)
+                ) - {self.robot_id}:
+                    movement_safety_reason = "peer_reverse_edge_reservation"
+
+            if movement_safety_reason is not None:
+                self.status = RobotStatus.WAITING
+                self.velocity = (0, 0)
+                self.waiting_until_tick = None
+                self.battery = max(0.0, self.battery - self.idle_cost)
+                events.append(Event(
+                    tick,
+                    EventType.ROBOT_WAITING,
+                    robot_id=self.robot_id,
+                    reason="safety_guard",
+                    safety_reason=movement_safety_reason,
+                    blocked_cell=list(next_cell),
+                ))
+                return events
+
+            # Perception can be stale or incomplete. Never cross the
+            # authoritative world boundary into a wall or active obstacle.
+            if world is not None and not world.is_traversable(*next_cell):
+                self.status = RobotStatus.WAITING
+                self.velocity = (0, 0)
+                self.waiting_until_tick = None
+                self.battery = max(0.0, self.battery - self.idle_cost)
+                events.append(Event(
+                    tick,
+                    EventType.ROBOT_WAITING,
+                    robot_id=self.robot_id,
+                    reason="safety_guard",
+                    safety_reason="cell_not_traversable",
+                    blocked_cell=list(next_cell),
                 ))
                 return events
 
